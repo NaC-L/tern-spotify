@@ -1,0 +1,4 @@
+# Generated Tern editor types and verification output.
+tern.d.luau
+target/
+*.log

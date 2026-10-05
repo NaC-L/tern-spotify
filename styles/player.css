@@ -1,0 +1,171 @@
+[data-surface='plugin.spotify.player'] {
+	--spotify-cover: 40px;
+
+	[data-role~='spotify-player'],
+	[data-role~='spotify-message'] {
+		align-items: center;
+		gap: 8px;
+		padding: 0;
+	}
+
+	[data-role~='spotify-cover'] {
+		flex: none;
+		width: var(--spotify-cover);
+	}
+	[data-role~='spotify-cover'] .sf-img-frame {
+		width: var(--spotify-cover);
+		height: var(--spotify-cover);
+		border-radius: 0;
+		box-shadow: none;
+	}
+	[data-role~='spotify-cover-empty'] {
+		height: var(--spotify-cover);
+		align-items: center;
+		justify-content: center;
+		background: var(--well);
+		color: var(--t4);
+	}
+
+	[data-role~='spotify-body'] {
+		flex: 1 1 0;
+		min-width: 0;
+		gap: 2px;
+	}
+	[data-role~='spotify-top'] {
+		align-items: center;
+		gap: 8px;
+	}
+	[data-role~='spotify-line'] {
+		flex: 1 1 0;
+		min-width: 0;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	[data-role~='spotify-controls'] {
+		flex: none;
+		align-items: center;
+		gap: 0;
+	}
+	[data-role~='spotify-button'] {
+		width: 20px;
+		height: 20px;
+		align-items: center;
+		justify-content: center;
+		border-radius: 0;
+		color: var(--t2);
+		cursor: pointer;
+	}
+	[data-role~='spotify-button']:hover {
+		background: var(--well);
+		color: var(--t1);
+	}
+	[data-role~='spotify-button'][data-tone='muted'] {
+		color: var(--t4);
+		cursor: default;
+		background: none;
+	}
+	[data-role~='spotify-button'][data-tone='accent'],
+	[data-role~='spotify-button-main'],
+	[data-role~='spotify-button-main']:hover {
+		color: var(--accent);
+	}
+	[data-role~='spotify-level'] {
+		width: 24px;
+		text-align: right;
+	}
+
+	[data-role~='spotify-timeline'] {
+		align-items: center;
+		gap: 6px;
+	}
+	[data-role~='spotify-time'] {
+		flex: none;
+		font-variant-numeric: tabular-nums;
+	}
+	[data-role~='spotify-bar'] {
+		flex: 1 1 0;
+		min-width: 0;
+	}
+
+	[data-role~='spotify-link'] {
+		flex: none;
+		cursor: pointer;
+	}
+
+	[data-role~='spotify-search'] {
+		gap: 0;
+		margin-top: 6px;
+	}
+	[data-role~='spotify-search'] [data-role~='spotify-line'] {
+		flex: none;
+		padding: 0 4px;
+	}
+	[data-role~='spotify-result'] {
+		cursor: pointer;
+	}
+	[data-role~='spotify-result']:hover,
+	[data-role~='spotify-selected'] {
+		background: var(--well);
+	}
+
+	[data-role~='spotify-search-hint'] {
+		align-items: center;
+		gap: 3px;
+		margin-left: 6px;
+		padding: 0 3px;
+		color: var(--t3);
+		cursor: pointer;
+	}
+	[data-role~='spotify-search-hint']:hover {
+		background: var(--well);
+		color: var(--t1);
+	}
+
+	[data-role~='spotify-heading'] {
+		flex: 1 1 0;
+		min-width: 0;
+		align-items: center;
+		gap: 6px;
+	}
+	[data-role~='spotify-mark'] {
+		flex: none;
+		width: 12px;
+	}
+	[data-role~='spotify-mark'] .sf-img-frame {
+		width: 12px;
+		height: 12px;
+		border-radius: 0;
+		box-shadow: none;
+	}
+	[data-role~='spotify-cover-empty'] [data-role~='spotify-mark'],
+	[data-role~='spotify-cover-empty'] [data-role~='spotify-mark'] .sf-img-frame {
+		width: 20px;
+		height: 20px;
+	}
+
+	[data-role~='spotify-glance'] {
+		/* About the height of the five lines beside it. */
+		--spotify-cover: 72px;
+		align-items: flex-start;
+		gap: 8px;
+	}
+	[data-role~='spotify-glance'] [data-role~='spotify-body'] {
+		gap: 1px;
+	}
+	/* In a column, the row rule's flex basis of 0 collapsed the lines to no height. */
+	[data-role~='spotify-glance'] [data-role~='spotify-line'] {
+		flex: none;
+		line-height: 1.25;
+	}
+	[data-role~='spotify-glance'] [data-role~='spotify-timeline'] {
+		gap: 6px;
+	}
+	[data-role~='spotify-glance'] .sf-progress .track {
+		height: 3px;
+	}
+	[data-role~='spotify-glance'] .sf-progress .lbl {
+		display: none;
+	}
+}
