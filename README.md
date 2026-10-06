@@ -6,9 +6,9 @@ an upcoming queue, playlist browsing, background lyrics, keyboard shortcuts, sea
 and the current track in the status line.
 Playback and library browsing use the official Spotify Web API with explicit browser sign-in; lyrics come from LRCLIB.
 
-![Tern Spotify demo: volume, Like, queue, playlists, and keyboard shortcuts](docs/tern-spotify-demo.gif)
+![Tern Spotify cursor demo: volume, Like, queue, and playlists](docs/tern-spotify-demo.gif)
 
-15-second demo of the real Tern UI with fixture data; no live Spotify library changes.
+17-second demo of the real Tern UI with a visible cursor and click highlights, using fixture data; no live Spotify library changes.
 
 ## Requirements
 
