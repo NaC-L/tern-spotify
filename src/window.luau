@@ -96,7 +96,7 @@ tern.timer(TICK_MS, tick)
 
 -- Only the window knows whether a player floats and whether it has focus; it tells the host half
 -- through the shared kv store, per pane. The host shows a glance (preview) while floating without
--- focus, and opens search when the player gains focus.
+-- focus; search opens only through an explicit action.
 local VIEW_CHECK_MS = 250
 local published: { [number]: string } = {}
 

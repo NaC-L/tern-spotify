@@ -1,7 +1,7 @@
 --!strict
 -- Search in the player block: a query line and one line per result. Results follow the typing from
--- the third character on; ↑↓ pick, Enter plays, Esc closes. The bridge runs Spotify's own search
--- inside the app and writes the results to search.json.
+-- the third character on; ↑↓ pick, Enter plays, Esc closes. The bridge uses the official Spotify
+-- Web API search and writes the results to search.json.
 
 local link = require("./link")
 local ui = tern.ui
@@ -12,6 +12,7 @@ local search = {}
 local MIN_CHARS = 3
 -- ...once typing has paused this long, so a burst of keys sends one search.
 local TYPE_PAUSE_MS = 150
+local RESULTS_POLL_MS = 500
 local RESULTS = tern.plugin.data .. (if tern.runtime.os == "windows" then "\\" else "/") .. "search.json"
 
 export type Item = { kind: string, id: string, title: string, detail: string, length_s: number? }
@@ -29,6 +30,7 @@ export type State = {
    -- The query last sent, and the command id its results come back under.
    sent: string,
    waiting: string?,
+   read_at: number,
    -- Order of every search sent, so a late answer to an older one never replaces a newer one.
    order: { [string]: number },
    shown: number,
@@ -50,6 +52,7 @@ function search.open(trigger: string?): State
       sent = "",
       waiting = nil,
       order = {},
+      read_at = -math.huge,
       shown = 0,
       items = {},
       selected = 1,
@@ -71,15 +74,17 @@ function search.poll(st: State, send: (op: string, arg: string) -> string): bool
       local id = send("search", query)
       st.order[id] = sent_count
       st.waiting = id
+      st.read_at = -math.huge
       return true
    end
-   if query == "" and #st.items > 0 then
+   if query == "" and (#st.items > 0 or st.waiting ~= nil or st.error ~= nil) then
       st.sent, st.items, st.waiting, st.error = "", {}, nil, nil
       return true
    end
-   if st.waiting == nil then
+   if st.waiting == nil or tern.now() - st.read_at < RESULTS_POLL_MS then
       return false
    end
+   st.read_at = tern.now()
    local ok, text = pcall(tern.fs.read, RESULTS, 1024 * 1024)
    if not ok then
       return false
@@ -167,7 +172,6 @@ local function with(node: Node, props: { [string]: any }): Node
    node.p = p
    return node
 end
-
 local KIND = { track = "♪", album = "◎", artist = "☺", playlist = "≡" }
 
 function search.view(st: State): Node
@@ -181,8 +185,14 @@ function search.view(st: State): Node
       with(ui.text({
          ui.span("/ ", "dim"),
          ui.span(st.query .. (if st.editing then "▏" else ""), "strong"),
-         ui.span("   " .. status, "dim"),
       }), { key = "query", role = "spotify-line spotify-query" }),
+      ui.el("div", {
+         key = "status", role = "spotify-status",
+         attrs = {
+            ["role"] = "status", ["aria-live"] = "polite",
+            ["data-state"] = if st.waiting then "loading" elseif st.error then "error" elseif st.sent ~= "" and #st.items == 0 then "empty" else "ready",
+         },
+      }, { ui.text(status) }),
    }
    for i, item in st.items do
       local spans: { Span } = {
@@ -195,12 +205,13 @@ function search.view(st: State): Node
       if item.length_s then
          table.insert(spans, ui.span("  " .. link.clock(item.length_s * 1000), "dim"))
       end
-      table.insert(lines, with(ui.text(spans), {
+      table.insert(lines, ui.el("button", {
          key = "r" .. i,
          role = if i == st.selected then "spotify-line spotify-result spotify-selected" else "spotify-line spotify-result",
          tone = if i == st.selected then "accent" else nil,
+         attrs = { ["aria-label"] = "Play " .. item.title .. (if item.detail ~= "" then " · " .. item.detail else ""), ["data-tip"] = "Play " .. item.title },
          actions = { click = "pick=" .. i },
-      }))
+      }, { ui.text(spans) }))
    end
    return with(ui.col(lines), { key = "search", role = "spotify-search" })
 end

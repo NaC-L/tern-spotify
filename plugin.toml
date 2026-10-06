@@ -1,8 +1,8 @@
 schema = 1
 id = "spotify"
 name = "Spotify"
-version = "0.1.0"
-description = "Now playing and playback controls for the Spotify desktop app on Windows."
+version = "0.2.0"
+description = "Now playing and playback controls through the official Spotify Web API on Windows."
 # Tern's chrome uses built-in icons; icons/spotify.svg is a generic music note, not a brand asset.
 icon = "wave"
 host = "src/host.luau"

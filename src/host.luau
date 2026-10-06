@@ -7,8 +7,10 @@ local ui = tern.ui
 
 type Snapshot = link.Snapshot
 
--- The bridge publishes within milliseconds of a change; the tick is what bounds the view's lag.
+-- The bridge polls Spotify every two seconds; the tick keeps position and local controls smooth.
 local TICK_MS = 100
+local LYRICS_POLL_MS = 500
+local PANEL_POLL_MS = 500
 local SEEK_STEP_MS = 10000
 local VOLUME_STEP = 5
 -- Below this level a 5 % step is a large jump in loudness, so steps shrink to 1 %.
@@ -17,6 +19,15 @@ local FINE_VOLUME_BELOW = 10
 local EXPECT_MS = 2500
 local NOTICE_MS = 4000
 
+
+type Library = {
+   offset: number,
+   back: { number },
+   waiting: string?,
+   read_at: number,
+   page: link.Playlists?,
+   selected: number,
+}
 type Block = {
    cx: BlockCx,
    -- The cover sent to this pane, as the blob Tern gave back.
@@ -25,11 +36,15 @@ type Block = {
    signature: string,
    -- Open while searching.
    search: search.State?,
+   panel: string?,
+   library: Library?,
+   focus_key: string?,
+   controls: { { key: string, action: string } }?,
    -- A generic music icon (icons/spotify.svg) as this pane's blob: Tern's own chrome only takes built-in icon names.
    mark: string?,
    -- Floating while another block has focus: shows the preview (see `glance_view`).
    glance: boolean,
-   -- Whether the pane had focus at the last tick, to open search when it gains it.
+   -- Focus changes update presentation only; panels open through explicit actions.
    focused: boolean,
 }
 
@@ -42,11 +57,14 @@ local ticking = false
 -- The position the view extrapolates from, re-anchored whenever the bridge reports a jump.
 local anchor = { timeline = -1, pos = 0, at = 0 }
 
+local lyrics_id: string? = nil
+local lyrics: link.Lyrics? = nil
+local lyrics_read_at = -math.huge
 local cover: { key: string?, bytes: string?, mime: string?, loading: string? } = {}
 local expected: { [string]: { value: any, expires: number } } = {}
 local notice: { text: string, expires: number }? = nil
 -- Command id → the pane that sent it, to show the bridge's answer there.
-local senders: { [string]: number } = {}
+local senders: { [string]: { pane: number, notice: string? } } = {}
 local answered: string? = nil
 
 -- State ---------------------------------------------------------------------------------------
@@ -90,6 +108,54 @@ end
 
 local function reanchor(pos: number)
    anchor = { timeline = anchor.timeline, pos = pos, at = tern.now() }
+end
+
+-- Poll only until the bridge publishes a terminal result for the current, connected track.
+local function poll_lyrics()
+   local s = snap
+   local id: string? = nil
+   if s and link.fresh(s) and s.app and not s.problem and not s.starting and not s.login and s.track then
+      id = s.track.id
+   end
+   if id ~= lyrics_id then
+      lyrics_id = id
+      lyrics = nil
+      lyrics_read_at = -math.huge
+   end
+   if id and id ~= "" and lyrics == nil and tern.now() - lyrics_read_at >= LYRICS_POLL_MS then
+      lyrics_read_at = tern.now()
+      lyrics = link.read_lyrics(id)
+   end
+end
+
+local function background_lyrics(): link.Lyrics?
+   local s = snap
+   local value = lyrics
+   if s and link.fresh(s) and s.app and s.playing and not s.problem and not s.starting and not s.login
+      and s.track and value and value.id == s.track.id and value.status == "ok" then
+      return value
+   end
+   return nil
+end
+
+-- Last timestamp at or before the actual extrapolated position; zero means the intro.
+local function lyric_index(value: link.Lyrics): number
+   if not value.synced then
+      return 0
+   end
+   local pos = position()
+   local first, last = 1, #value.lines
+   local found = 0
+   while first <= last do
+      local middle = (first + last) // 2
+      if value.lines[middle].t <= pos then
+         found = middle
+         first = middle + 1
+      else
+         last = middle - 1
+      end
+   end
+   return found
 end
 
 local function say(text: string)
@@ -144,29 +210,38 @@ local function take_reply(s: Snapshot)
       return
    end
    answered = reply.id
-   local pane = senders[reply.id]
+   local sender = senders[reply.id]
    senders[reply.id] = nil
-   if pane and reply.error then
+   local block = if sender then blocks[sender.pane] else nil
+   if sender and not reply.error and sender.notice and block then
+      say(sender.notice)
+   end
+   if sender and reply.error then
       expected = {}
-      local block = blocks[pane]
       if block then
          block.cx:toast("error", "Spotify", reply.error)
+         local library = block.library
+         if library and library.waiting == reply.id then
+            library.page = { id = reply.id, items = {}, offset = library.offset, error = reply.error }
+            library.waiting = nil
+            block.signature = ""
+         end
       end
    end
 end
 
 -- Commands --------------------------------------------------------------------------------------
 
-local function send(block: Block, op: string, arg: (string | number)?): string
+local function send(block: Block, op: string, arg: (string | number)?, success_notice: string?): string
    local id = link.send(op, arg)
-   senders[id] = block.cx.pane
+   senders[id] = { pane = block.cx.pane, notice = success_notice }
    return id
 end
 
 local function toggle(block: Block)
    local s = snap
    if s == nil or not s.app then
-      send(block, "launch")
+      send(block, "login")
       return
    end
    if not s.can.toggle then
@@ -175,6 +250,16 @@ local function toggle(block: Block)
    reanchor(position())
    expect("playing", not playing())
    send(block, "toggle")
+end
+
+local function toggle_like(block: Block)
+   local s = snap
+   if s == nil or not link.fresh(s) or s.track == nil or s.liked == nil then
+      return
+   end
+   local on = not shown("liked", s.liked)
+   expect("liked", on)
+   send(block, "like", (if on then "on " else "off ") .. s.track.id)
 end
 
 local function seek(block: Block, ms: number)
@@ -242,6 +327,24 @@ local function toggle_mute(block: Block)
    send(block, "mute", if on then "on" else "off")
 end
 
+
+local function close_panels(block: Block)
+   block.search = nil
+   block.panel = nil
+   block.library = nil
+   block.focus_key = nil
+end
+
+local function load_playlists(block: Block, offset: number, back: { number })
+   block.library = {
+      offset = offset,
+      back = back,
+      waiting = send(block, "playlists", tostring(offset)),
+      read_at = -math.huge,
+      page = nil,
+      selected = 1,
+   }
+end
 local function act(block: Block, name: string)
    if name == "playpause" then
       toggle(block)
@@ -255,6 +358,8 @@ local function act(block: Block, name: string)
       shuffle(block)
    elseif name == "repeat" then
       cycle_repeat(block)
+   elseif name == "like" then
+      toggle_like(block)
    elseif name == "mute" then
       toggle_mute(block)
    elseif name == "louder" or name == "quieter" then
@@ -262,10 +367,40 @@ local function act(block: Block, name: string)
       local louder = name == "louder"
       local step = if (if louder then level < FINE_VOLUME_BELOW else level <= FINE_VOLUME_BELOW) then 1 else VOLUME_STEP
       set_volume(block, level + (if louder then step else -step))
-   elseif name == "launch" or name == "relaunch" then
+   elseif name == "launch" or name == "login" then
       send(block, name)
-   elseif name == "search" then
-      block.search = block.search or search.open()
+   elseif name == "close" then
+      close_panels(block)
+   elseif name == "search" or name == "queue" or name == "playlists" or name == "add" or name == "keys" then
+      if name == "add" and (snap == nil or not link.fresh(snap) or snap.track == nil) then
+         return
+      end
+      close_panels(block)
+      if name == "search" then
+         block.search = search.open()
+      else
+         block.panel = name
+         if name == "playlists" or name == "add" then
+            load_playlists(block, 0, {})
+         end
+      end
+   elseif name == "playlist-retry" then
+      local library = block.library
+      if library and library.waiting == nil then
+         load_playlists(block, library.offset, library.back)
+      end
+   elseif name == "playlist-next" or name == "playlist-back" then
+      local library = block.library
+      if library and library.page and library.waiting == nil then
+         local back = table.clone(library.back)
+         if name == "playlist-next" and library.page.next then
+            table.insert(back, library.offset)
+            load_playlists(block, library.page.next, back)
+         elseif name == "playlist-back" and #back > 0 then
+            local offset = table.remove(back) :: number
+            load_playlists(block, offset, back)
+         end
+      end
    elseif name == "retry" then
       link.retry()
       bridge_problem = link.ensure(link.read())
@@ -274,7 +409,35 @@ end
 
 local function play_item(block: Block, item: search.Item)
    send(block, "play", item.kind .. " " .. item.id)
-   block.search = nil
+   close_panels(block)
+end
+
+local function pick_playlist(block: Block, item: link.Playlist)
+   if block.panel == "add" then
+      local s = snap
+      if s == nil or not link.fresh(s) or s.track == nil or item.editable ~= true then
+         return
+      end
+      send(block, "add", item.id .. " " .. s.track.id, "Added to " .. item.title)
+      close_panels(block)
+   else
+      play_item(block, item)
+   end
+end
+
+local function invoke(block: Block, name: string, value: any)
+   local index = tonumber(value)
+   local st = block.search
+   local library = block.library
+   if name == "pick" and st and index and st.items[index] then
+      play_item(block, st.items[index])
+   elseif name == "playlist-pick" and library and library.page and index and library.page.items[index] then
+      pick_playlist(block, library.page.items[index])
+   elseif name == "volume" and index then
+      set_volume(block, index)
+   else
+      act(block, name)
+   end
 end
 
 -- View ------------------------------------------------------------------------------------------
@@ -289,19 +452,186 @@ local function with(node: Node, props: { [string]: any }): Node
 end
 
 local function button(key: string, icon: string, action: string, enabled: boolean, lit: boolean?): Node
-   local props: { [string]: any } = {
+   local labels = {
+      prev = "Previous song (P)", next = "Next song (N)",
+      playpause = if playing() then "Pause (Space)" else "Play (Space)",
+      shuffle = "Shuffle (S)", ["repeat"] = "Cycle repeat (R)",
+      mute = if snap and shown("muted", snap.muted) then "Unmute (M)" else "Mute (M)",
+   }
+   local label = labels[key] or key
+   local text = if key == "prev" then "Prev" elseif key == "repeat" then "Repeat" else string.match(label, "^(%S+)") or label
+   if key == "shuffle" then
+      text = "Shuffle " .. (if snap and shown("shuffle", snap.shuffle) then "on" else "off")
+   elseif key == "repeat" then
+      text = "Repeat " .. tostring(shown("repeat", snap and snap["repeat"]) or "off")
+   end
+   return ui.el("button", {
       key = key,
       role = if key == "playpause" then "spotify-button spotify-button-main" else "spotify-button",
       tone = if not enabled then "muted" elseif lit then "accent" else nil,
-   }
-   if enabled then
-      props.actions = { click = action }
-   end
-   return with(ui.row({ ui.node("icon", { name = icon }) }), props)
+      disabled = not enabled,
+      attrs = { ["aria-label"] = label, ["data-tip"] = label },
+      actions = if enabled then { click = action } else nil,
+   }, { ui.node("icon", { name = icon }), ui.text(text) })
 end
 
-local function link_button(key: string, label: string, action: string): Node
-   return with(ui.badge(label, "accent"), { key = key, role = "spotify-link", actions = { click = action } })
+local function like_button(s: Snapshot): Node
+   local liked = shown("liked", s.liked) == true
+   return ui.el("button", {
+      key = "like",
+      role = "spotify-button spotify-like",
+      tone = if liked then "accent" else nil,
+      disabled = not link.fresh(s) or s.track == nil or s.liked == nil,
+      actions = if link.fresh(s) and s.track ~= nil and s.liked ~= nil then { click = "like" } else nil,
+   }, { ui.text(if liked then "Liked" else "Like") })
+end
+
+local function link_button(key: string, label: string, action: string, enabled: boolean?): Node
+   local name = if key == "quieter" then "Decrease volume (− / Down)" elseif key == "louder" then "Increase volume (+ / Up)" else label
+   return ui.el("button", {
+      key = key,
+      role = "spotify-link",
+      disabled = enabled == false,
+      attrs = { ["aria-label"] = name, ["data-tip"] = name },
+      actions = if enabled == false then nil else { click = action },
+   }, { ui.text(label) })
+end
+
+local function volume_view(s: Snapshot): Node
+   local enabled = s.can.volume and s.volume ~= nil
+   local level = shown("volume", s.volume)
+   local muted = shown("muted", s.muted) == true
+   local segments: { Node } = {}
+   for value = 10, 100, 10 do
+      local filled = level ~= nil and value <= level and not muted
+      table.insert(segments, ui.el("button", {
+         key = "volume-" .. value,
+         role = if filled then "spotify-volume-segment spotify-volume-active" else "spotify-volume-segment",
+         disabled = not enabled,
+         actions = if enabled then { click = "volume=" .. value } else nil,
+      }, { ui.text(tostring(value)), ui.text(if filled then "▮" else "▯") }))
+   end
+   return with(ui.row({
+      button("mute", if muted then "slash-circle" else "wave", "mute", enabled, muted),
+      link_button("quieter", "− volume", "quieter", enabled),
+      with(ui.row(segments), { key = "volume-bar", role = "spotify-controls spotify-volume-bar" }),
+      with(ui.text((if level ~= nil then tostring(level) .. "%" else "Volume unavailable") .. (if muted then " · muted" else "")), {
+         key = "level", role = "spotify-level",
+      }),
+      link_button("louder", "+ volume", "louder", enabled),
+   }), { key = "volume", role = "spotify-controls spotify-volume" })
+end
+
+local function next_source(s: Snapshot): Node
+   local next_track = s.next
+   local lines = {
+      with(ui.text(if next_track then "Next: " .. next_track.title .. (if next_track.artist ~= "" then " · " .. next_track.artist else "")
+         elseif s.queue then "Next: queue is empty" else "Next: unavailable"), { key = "next", role = "spotify-line spotify-next" }),
+      with(ui.text(if s.source and s.source ~= "" then "From: " .. s.source else "Source unavailable"), { key = "source", role = "spotify-line spotify-source" }),
+   }
+   return with(ui.col(lines), { key = "next-source", role = "spotify-next-source" })
+end
+
+local function navigation(block: Block): Node
+   local controls: { Node } = {}
+   for _, entry in { { "search", "Search", "F / /" }, { "queue", "Up next", "Q" }, { "playlists", "Playlists", "L" }, { "add", "Add to playlist", "A" }, { "keys", "Keys", "?" } } do
+      local active = if entry[1] == "search" then block.search ~= nil else block.panel == entry[1]
+      local enabled = entry[1] ~= "add" or (snap ~= nil and link.fresh(snap) and snap.track ~= nil)
+      table.insert(controls, ui.el("button", {
+         key = entry[1],
+         role = "spotify-link",
+         disabled = not enabled,
+         attrs = {
+            ["aria-label"] = entry[2],
+            ["data-tip"] = entry[2] .. " (" .. entry[3] .. ")",
+            ["aria-expanded"] = tostring(active),
+         },
+         actions = if enabled then { click = entry[1] } else nil,
+      }, { ui.text(entry[2]) }))
+   end
+   if block.search or block.panel then
+      table.insert(controls, link_button("close", "Close (Esc)", "close"))
+   end
+   return with(ui.row(controls), { key = "navigation", role = "spotify-controls spotify-navigation" })
+end
+
+local function panel_view(block: Block): Node
+   local kind = block.panel
+   local title = if kind == "queue" then "Up next · read-only" elseif kind == "playlists" then "Your playlists" elseif kind == "add" then "Add to playlist" else "Keyboard shortcuts"
+   local lines: { Node } = { with(ui.text(title), { key = "title", role = "spotify-panel-title" }) }
+   local function status(text: string, state: string)
+      table.insert(lines, ui.el("div", {
+         key = "status", role = "spotify-status",
+         attrs = { ["role"] = "status", ["aria-live"] = "polite", ["data-state"] = state },
+      }, { ui.text(text) }))
+   end
+   if kind == "queue" then
+      local s = snap
+      if s == nil or s.starting then
+         status("Loading queue…", "loading")
+      elseif not link.fresh(s) or s.problem or not s.app or s.login then
+         status(s.problem or "Queue unavailable. Sign in or reconnect Spotify.", "error")
+         table.insert(lines, link_button("queue-login", "Sign in", "login"))
+         table.insert(lines, link_button("queue-retry", "Retry connection", "retry"))
+      elseif s.queue == nil then
+         status("Spotify has not provided a queue.", "unavailable")
+      elseif #s.queue == 0 then
+         status("No upcoming songs.", "empty")
+      else
+         for i, item in s.queue do
+            table.insert(lines, with(ui.text({
+               ui.span(tostring(i) .. ". " .. item.title, "strong"),
+               ui.span((if item.artist ~= "" then " · " .. item.artist else "") .. (if item.length_ms then " · " .. link.clock(item.length_ms) else ""), "muted"),
+            }), { key = "queue-" .. i, role = "spotify-line spotify-queue-item" }))
+         end
+      end
+   elseif kind == "playlists" or kind == "add" then
+      local library = block.library
+      local page = library and library.page
+      if library == nil or library.waiting then
+         status("Loading playlists…", "loading")
+      elseif page and page.error then
+         status(page.error .. " Sign in if access is needed, then retry.", "error")
+         table.insert(lines, link_button("playlist-login", "Sign in", "login"))
+         table.insert(lines, link_button("playlist-retry", "Retry playlists", "playlist-retry"))
+      elseif page and library then
+         if #page.items == 0 then
+            status(if kind == "add" then "No editable playlists on this page." else "No playlists on this page.", "empty")
+         end
+         for i, item in page.items do
+            local enabled = kind ~= "add" or (snap ~= nil and link.fresh(snap) and snap.track ~= nil)
+            table.insert(lines, ui.el("button", {
+               key = "playlist-" .. i,
+               role = if library.selected == i then "spotify-line spotify-result spotify-selected" else "spotify-line spotify-result",
+               disabled = not enabled,
+               attrs = { ["aria-label"] = (if kind == "add" then "Add to playlist " else "Play playlist ") .. item.title .. (if item.detail ~= "" then " · " .. item.detail else ""), ["data-tip"] = (if kind == "add" then "Add to " else "Play playlist ") .. item.title },
+               actions = if enabled then { click = "playlist-pick=" .. i } else nil,
+            }, { ui.text({ ui.span(item.title, "strong"), ui.span(if item.detail ~= "" then " · " .. item.detail else "", "muted") }) }))
+         end
+         table.insert(lines, with(ui.row({
+            link_button("playlist-back", "Previous page", "playlist-back", #library.back > 0),
+            with(ui.text("From item " .. tostring(library.offset + 1)), { key = "offset", role = "spotify-page-offset" }),
+            link_button("playlist-next", "Next page", "playlist-next", page.next ~= nil),
+         }), { key = "pages", role = "spotify-controls spotify-pages" }))
+      end
+   else
+      for i, text in {
+         "Tab / Shift+Tab: choose control · Enter: activate",
+         "Space / K: play or pause · P / N: previous / next",
+         "← / →: seek 10 seconds · 0–9: seek to 0–90%",
+         "+ / − or ↑ / ↓: volume · M: mute · bar: 10–100%",
+         "S: shuffle · R: repeat · H: like / unlike · O: open Spotify",
+         "F / /: search · Q: up next · L: playlists · A: add to playlist · ?: keys",
+         "Search: type, ↑ / ↓ select, Enter plays",
+         "Playlists: ↑ / ↓ select, Enter plays, ← / → pages",
+         "Add to playlist: ↑ / ↓ select, Enter adds, ← / → pages",
+         "Sign in again to grant library / playlist permissions",
+         "Esc or Close: dismiss without playing",
+      } do
+         table.insert(lines, with(ui.text(text), { key = "hint-" .. i, role = "spotify-key-hint" }))
+      end
+   end
+   return with(ui.col(lines), { key = "panel", role = "spotify-panel", attrs = { ["aria-label"] = title } })
 end
 
 local MARK_SVG: string? = (function()
@@ -361,28 +691,13 @@ local function now_playing(block: Block, s: Snapshot): Node
       -- reached the block.
       button("playpause", if playing() then "pause" else "play", "playpause", s.can.toggle),
       button("next", "frame-next", "next", s.can.next),
+      like_button(s),
    }
    if s.can.shuffle then
       table.insert(controls, button("shuffle", "swap", "shuffle", true, shown("shuffle", s.shuffle) == true))
    end
    if s.can["repeat"] then
       table.insert(controls, button("repeat", "repeat", "repeat", true, (shown("repeat", s["repeat"]) or "off") ~= "off"))
-   end
-   local level = shown("volume", s.volume)
-   if s.can.volume and level then
-      local muted = shown("muted", s.muted) == true
-      table.insert(controls, button("mute", if muted then "slash-circle" else "wave", "mute", true, muted))
-      table.insert(controls, with(ui.text({ ui.span(if muted then "mute" else tostring(level), "muted") }), {
-         key = "level",
-         role = "spotify-level",
-      }))
-   end
-   if block.search == nil then
-      -- Says that search exists and which key opens it; clicking opens it too.
-      table.insert(controls, with(ui.row({
-         ui.node("icon", { name = "search" }),
-         ui.text({ ui.span("f", "key") }),
-      }), { key = "search", role = "spotify-search-hint", actions = { click = "search" } }))
    end
 
    local pos = position()
@@ -404,14 +719,13 @@ local function now_playing(block: Block, s: Snapshot): Node
             with(ui.row(controls), { key = "controls", role = "spotify-controls" }),
          }), { key = "top", role = "spotify-top" }),
          timeline,
+         volume_view(s),
+         next_source(s),
       }), { key = "body", role = "spotify-body" }),
    }), { key = "player", role = "spotify-player" })
 end
 
--- A floating player without focus. Tern keeps the card a few lines tall, so it fills them: cover
--- beside title, artist · album, the timeline with times, then the stream format and what plays
--- next. Nothing to click (Tern gives presses on an unfocused floating block to its card, which
--- focuses it).
+-- Keep playback, volume and context available in the compact unfocused floating player.
 local function glance_view(block: Block, s: Snapshot): Node
    local track = s.track :: link.Track
    local function line(key: string, spans: { Span }): Node
@@ -426,6 +740,7 @@ local function glance_view(block: Block, s: Snapshot): Node
             button("prev", "frame-prev", "prev", s.can.prev),
             button("playpause", if playing() then "pause" else "play", "playpause", s.can.toggle),
             button("next", "frame-next", "next", s.can.next),
+            like_button(s),
          }), { key = "controls", role = "spotify-controls" }),
       }), { key = "top", role = "spotify-top" }),
    }
@@ -461,28 +776,58 @@ local function glance_view(block: Block, s: Snapshot): Node
    if s["repeat"] and s["repeat"] ~= "off" then
       fact("repeat " .. s["repeat"])
    end
-   if s.volume then
-      fact(if s.muted then "muted" else "vol " .. tostring(s.volume))
-   end
    if #facts > 0 then
       table.insert(lines, line("facts", facts))
    end
 
-   local next_track = s.next
-   if next_track then
-      table.insert(lines, line("next", {
-         ui.span("next ", "dim"),
-         ui.span(next_track.title),
-         ui.span(if next_track.artist ~= "" then " · " .. next_track.artist else "", "muted"),
-      }))
-   elseif s.source then
-      table.insert(lines, line("source", { ui.span("from ", "dim"), ui.span(s.source :: string, "muted") }))
-   end
+   table.insert(lines, volume_view(s))
+   table.insert(lines, next_source(s))
 
    return with(ui.row({
       cover_node(block, s),
       with(ui.col(lines), { key = "body", role = "spotify-body" }),
    }), { key = "glance", role = "spotify-player spotify-glance" })
+end
+
+local function scene(children: { Node }): Node
+   local layers: { Node } = {
+      with(ui.col(children), { key = "foreground", role = "spotify-foreground" }),
+   }
+   local value = background_lyrics()
+   if value then
+      local active = lyric_index(value)
+      local lines: { Node } = {}
+      for slot = 1, 3 do
+         local index = if value.synced then active + slot - 2 else slot
+         local line = value.lines[index]
+         local text = if line then line.text else ""
+         local highlighted = value.synced and active > 0 and index == active
+         table.insert(lines, with(ui.text({ ui.span(if text == "" then "\u{a0}" else text) }), {
+            key = "lyric-" .. tostring(slot),
+            role = if highlighted then "spotify-lyric spotify-lyric-active" else "spotify-lyric",
+         }))
+      end
+      table.insert(layers, with(ui.col(lines), { key = "lyrics", role = "spotify-lyrics" }))
+   end
+   -- BlockView's root is not a DOM node: its role belongs to the full main region.
+   return with(ui.col(layers), { role = "spotify-scene" })
+end
+
+-- Tern routes Tab to the block input, so keep control navigation in the block as well.
+local function collect_controls(block: Block, node: Node, controls: { { key: string, action: string } })
+   local props = node.p
+   local action = props and props.actions and props.actions.click
+   if props and not props.disabled and type(action) == "string" and type(props.key) == "string" then
+      table.insert(controls, { key = props.key, action = action })
+      if block.focus_key == props.key then
+         props.role = (props.role or "") .. " spotify-key-focus"
+      end
+   end
+   if node.c then
+      for _, child in node.c do
+         collect_controls(block, child, controls)
+      end
+   end
 end
 
 local function view(block: Block): BlockView
@@ -492,25 +837,43 @@ local function view(block: Block): BlockView
       main = message(block, "Bridge not running", bridge_problem, { link_button("retry", "Retry", "retry") }, "error")
    elseif s == nil then
       main = message(block, "Spotify", "Connecting…", {})
+   elseif s.login or not s.app then
+      main = message(block, "Sign in to Spotify", s.problem or "Authorize Tern in your browser.", { link_button("login", "Sign in", "login") })
    elseif s.starting then
-      main = message(block, "Starting Spotify", "with remote control…", {})
-   elseif s.relaunch then
-      main = message(block, "Restart needed", "Spotify is running without remote control.", { link_button("relaunch", "Restart Spotify", "relaunch") }, "warning")
+      main = message(block, "Opening Spotify", "", {})
    elseif s.problem then
       main = message(block, "Can't reach Spotify", s.problem, { link_button("retry", "Retry", "retry") }, "warning")
-   elseif not s.app then
-      main = message(block, "Spotify isn't running", "", { link_button("launch", "Open", "launch") })
    elseif s.track == nil then
       main = message(block, "Nothing playing", "", { link_button("launch", "Open", "launch") })
    elseif block.glance then
-      return { main = ui.col({ glance_view(block, s) }) }
+      main = glance_view(block, s)
    else
       main = now_playing(block, s)
    end
-   local st = block.search
-   local result: BlockView = { main = ui.col(if st then { main, search.view(st) } else { main }) }
+   local children: { Node } = { main, navigation(block) }
+   if block.search then
+      table.insert(children, search.view(block.search))
+   elseif block.panel then
+      table.insert(children, panel_view(block))
+   end
+   local result: BlockView = { main = scene(children) }
    if notice then
       result.dock = ui.col({ with(ui.text({ ui.span(notice.text, "muted") }), { key = "notice" }) })
+   end
+   local controls: { { key: string, action: string } } = {}
+   collect_controls(block, result.main :: Node, controls)
+   block.controls = controls
+   if block.focus_key then
+      local found = false
+      for _, control in controls do
+         if control.key == block.focus_key then
+            found = true
+            break
+         end
+      end
+      if not found then
+         block.focus_key = nil
+      end
    end
    return result
 end
@@ -518,7 +881,10 @@ end
 -- What the view depends on; panes re-render only when it changes.
 local function signature(): string
    local s = snap
-   local parts = { if notice then notice.text else "", bridge_problem or "", tostring(playing()) }
+   local parts = { if notice then notice.text else "", bridge_problem or "", tostring(playing()), tostring(link.fresh(s)) }
+   local value = background_lyrics()
+   table.insert(parts, if value then value.status .. ":" .. tostring(lyric_index(value)) else "lyrics-hidden")
+   table.insert(parts, if lyrics then lyrics.status else "lyrics-pending")
    if s then
       local beat = s.beat
       s.beat = 0
@@ -554,6 +920,9 @@ local function tick()
    local latest = link.read()
    bridge_problem = link.ensure(latest)
    if latest and (link.fresh(latest) or snap == nil) then
+      if (if snap and snap.track then snap.track.id else nil) ~= (if latest.track then latest.track.id else nil) then
+         expected["liked"] = nil
+      end
       snap = latest
       if latest.timeline ~= anchor.timeline then
          anchor = { timeline = latest.timeline, pos = latest.position_ms or 0, at = tern.now() }
@@ -561,6 +930,7 @@ local function tick()
       load_cover(latest)
       take_reply(latest)
    end
+   poll_lyrics()
    if notice and tern.now() > notice.expires then
       notice = nil
    end
@@ -577,27 +947,44 @@ local function tick()
       end) then
          block.signature = ""
       end
+      local library = block.library
+      if (block.panel == "playlists" or block.panel == "add") and library and library.waiting and tern.now() - library.read_at >= PANEL_POLL_MS then
+         library.read_at = tern.now()
+         local page = link.read_playlists(library.waiting, library.offset)
+         if page then
+            if block.panel == "add" then
+               local editable: { link.Playlist } = {}
+               for _, item in page.items do
+                  if item.editable == true then
+                     table.insert(editable, item)
+                  end
+               end
+               page.items = editable
+            end
+            library.page = page
+            library.waiting = nil
+            block.signature = ""
+         end
+      end
       local pane_view = link.pane_view(block.cx.pane)
       local glance = pane_view.floating and not pane_view.focused
       if pane_view.focused ~= block.focused then
          block.focused = pane_view.focused
-         -- Focusing the player opens search; leaving it closes an untouched one.
-         if pane_view.focused then
-            block.search = block.search or search.open()
-         elseif block.search and block.search.query == "" then
-            block.search = nil
-         end
          block.signature = ""
       end
       if glance ~= block.glance then
          block.glance = glance
-         -- A glance drops search; focusing the player again starts from the full view.
+         -- Entering compact presentation dismisses panels; returning never opens them.
          if glance then
-            block.search = nil
+            close_panels(block)
          end
          block.signature = ""
       end
       local block_sig = if block.search then sig .. "\u{1f}" .. search.signature(block.search) else sig
+      block_sig ..= "\u{1f}" .. (block.panel or "")
+      if block.library then
+         block_sig ..= "\u{1f}" .. tostring(block.library.selected)
+      end
       if glance then
          block_sig ..= "\u{1f}glance"
       end
@@ -645,8 +1032,43 @@ tern.block.define("player", {
    end,
 
    key = function(block: Block, key: Key, _cx: BlockCx): boolean?
+      if key.name ~= "tab" and key.name ~= "enter" and block.focus_key then
+         block.focus_key = nil
+         block.signature = ""
+      end
       if key.ctrl or key.alt or key.meta then
          return false
+      end
+      if key.name == "tab" or (key.name == "enter" and block.focus_key) then
+         view(block)
+         local controls = block.controls or {}
+         local selected = 0
+         for i, control in controls do
+            if control.key == block.focus_key then
+               selected = i
+               break
+            end
+         end
+         if key.name == "tab" and #controls > 0 then
+            if selected == 0 then
+               selected = if key.shift then #controls else 1
+            else
+               selected = (selected - 1 + (if key.shift then -1 else 1)) % #controls + 1
+            end
+            block.focus_key = controls[selected].key
+         elseif selected > 0 then
+            local action = controls[selected].action
+            local name, value = string.match(action, "^([^=]+)=(.*)$")
+            block.focus_key = nil
+            invoke(block, name or action, value)
+         end
+         block.signature = ""
+         return true
+      end
+      if key.name == "escape" or key.name == "esc" then
+         close_panels(block)
+         block.signature = ""
+         return true
       end
       local st = block.search
       if st then
@@ -656,9 +1078,25 @@ tern.block.define("player", {
          elseif type(result) == "table" then
             play_item(block, result :: search.Item)
          end
-         -- Search opens with focus, so keys it leaves alone (space on an empty query, ←→) still
-         -- drive the player.
+         -- Unhandled search keys still control playback.
          if result ~= false then
+            block.signature = ""
+            return true
+         end
+      end
+      local library = block.library
+      if (block.panel == "playlists" or block.panel == "add") and library then
+         local page = library.page
+         if key.name == "up" or key.name == "down" then
+            library.selected = math.clamp(library.selected + (if key.name == "down" then 1 else -1), 1, math.max(1, if page then #page.items else 0))
+         elseif key.name == "enter" and page and page.items[library.selected] then
+            pick_playlist(block, page.items[library.selected])
+         elseif key.name == "left" or key.name == "right" then
+            act(block, if key.name == "left" then "playlist-back" else "playlist-next")
+         else
+            library = nil
+         end
+         if library then
             block.signature = ""
             return true
          end
@@ -666,7 +1104,13 @@ tern.block.define("player", {
       local s = snap
       local typed = key.text or key.name
       if typed == "/" or typed == "f" then
-         block.search = block.search or search.open(typed)
+         close_panels(block)
+         block.search = search.open(typed)
+         block.signature = ""
+         return true
+      end
+      if typed == "q" or typed == "l" or typed == "a" or typed == "?" then
+         act(block, if typed == "q" then "queue" elseif typed == "l" then "playlists" elseif typed == "a" then "add" else "keys")
          block.signature = ""
          return true
       end
@@ -684,6 +1128,8 @@ tern.block.define("player", {
          act(block, "shuffle")
       elseif typed == "r" then
          act(block, "repeat")
+      elseif typed == "h" then
+         act(block, "like")
       elseif typed == "+" or typed == "=" or key.name == "up" then
          act(block, "louder")
       elseif typed == "-" or key.name == "down" then
@@ -702,13 +1148,8 @@ tern.block.define("player", {
 
    event = function(block: Block, ev: UiEvent, _cx: BlockCx)
       if ev.ev == "action" and type(ev.act) == "string" then
-         local st = block.search
-         local index = tonumber(ev.value)
-         if ev.act == "pick" and st and index and st.items[index] then
-            play_item(block, st.items[index])
-         else
-            act(block, ev.act)
-         end
+         block.focus_key = nil
+         invoke(block, ev.act, ev.value)
          block.signature = ""
       end
    end,
