@@ -8,7 +8,7 @@ Playback and library browsing use the official Spotify Web API with explicit bro
 
 ![Tern Spotify cursor demo: volume, Like, queue, and playlists](docs/tern-spotify-demo.gif)
 
-17-second demo of the real Tern UI with a visible cursor and click highlights, using fixture data; no live Spotify library changes.
+17-second demo featuring “Bubblegum Bitch” by MARINA, real Spotify artwork and queue, plus a visible cursor and click highlights. Library actions and playlist destinations are simulated; no live Spotify library changes.
 
 ## Requirements
 
